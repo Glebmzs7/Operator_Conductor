@@ -57,6 +57,12 @@ from Class_Gui import AutoSyncGUI, remote_to_github_web_url
 REASON_START = "Запуск"
 REASON_PUSH = "Пуш"
 
+# Повторы пуша (см. _action_push): сколько раз максимум сдвигать номер тега, если он реально
+# занят на git; сколько раз повторять тот же тег при обрыве связи и с какой паузой (секунды).
+_PUSH_TAG_ATTEMPTS = 50
+_PUSH_NETWORK_RETRIES = 3
+_PUSH_NETWORK_RETRY_PAUSE = 10
+
 # Служебные/временные файлы, которые НЕ должны триггерить коммит (см. IGNORE_PATTERNS ниже).
 IGNORE_PATTERNS = [
     "*.tmp",
@@ -141,8 +147,27 @@ class RepoWatcher(FileSystemEventHandler):
         self.name = repo_cfg["name"]
         self.watch_paths = list(repo_cfg["watch_paths"]) or [""]
         self.dev_id = dev_id
-        self._lock = threading.Lock()
+        # RLock, а не Lock (исправлено 26.09): sverka_versiy вызывает сама себя, ещё держа
+        # блокировку — после успешного пуша ("синхронизировано" -> повторная сверка), после
+        # выбора в диалоге расхождения, после повтора при ошибке связи. С обычным Lock такой
+        # повторный вызов из того же потока ждал сам себя вечно: репозиторий намертво зависал
+        # после ПЕРВОГО же успешного пуша — дальше в журнале только "Плановая (периодическая)
+        # проверка..." без git fetch, и события файлов больше не обрабатывались (GIT_Automation
+        # и Power_struggle в Beta 25.09–26.09). RLock разрешает повторный вход тому же потоку.
+        self._lock = threading.RLock()
         self._observed_watches: list = []  # для пере-регистрации слежения при смене пути
+
+        # Диагностика и состояние "Проблема" (26.09):
+        # check_stage/check_started_at — на каком этапе и с какого времени идёт текущая проверка
+        # (пишется в журнал, если следующая проверка не может начаться, пока идёт эта).
+        # _recheck_requested — пока шла проверка, пришло событие файла; проверим ещё раз сразу
+        # после окончания текущей (раньше такие события просто ждали блокировку в очереди).
+        # problem — текст проблемы: проверка не прошла, таймер и слежение для репозитория
+        # приостановлены, строка подсвечена; снимается только кнопкой "Повторить проверку".
+        self.check_stage: str = ""
+        self.check_started_at: Optional[float] = None
+        self._recheck_requested: bool = False
+        self.problem: Optional[str] = None
 
         self.check_interval_seconds = check_interval_seconds
         self.next_check_at = time.time() + self.check_interval_seconds
@@ -330,6 +355,10 @@ class RepoWatcher(FileSystemEventHandler):
     def _handle_fs_event(self, event, event_label: str) -> None:
         if not self.running:
             return  # на всякий случай — по идее watch уже снят, событие сюда не должно прийти
+        if self.problem is not None:
+            # Репозиторий в состоянии "Проблема" — ждём "Повторить проверку" от пользователя.
+            # Изменения не теряются: повторная проверка увидит их через git status.
+            return
         if event.is_directory:
             return  # саму папку не коммитим — отдельные файлы внутри неё дадут свои события
 
@@ -374,37 +403,107 @@ class RepoWatcher(FileSystemEventHandler):
 
     # --- СВЕРКА_ВЕРСИЙ и действия ---------------------------------------------------
 
+    # Если проверка идёт дольше этого (и не ждёт ответа пользователя) — считаем, что она зависла,
+    # и поднимаем "Проблему", чтобы это было видно в окне, а не только тишиной в журнале.
+    _HUNG_CHECK_SECONDS = 10 * 60
+
+    def set_stage(self, stage: str) -> None:
+        """Отметить этап текущей проверки — только для диагностики (см. sverka_versiy)."""
+        self.check_stage = stage
+
+    def set_problem(self, message: str) -> None:
+        """Проверка не прошла: останавливаем таймер и слежение для этого репозитория, подсвечиваем
+        строку как проблему и ждём, пока пользователь нажмёт "Повторить проверку"
+        (retry_check_runtime). Сами повторять не пытаемся — именно бесконечные автоповторы и
+        давали "бесконечный пуш"."""
+        self.problem = message
+        self.last_check_time = _now_str()
+        self.last_action = "ПРОБЛЕМА — нужна повторная проверка"
+        log(self.name, f"ПРОБЛЕМА (таймер остановлен, ждём «Повторить проверку»): {message}")
+
     def sverka_versiy(self, reason: str) -> None:
-        with self._lock:  # чтобы два быстрых сохранения подряд не гонялись за git одновременно
-            self.last_action = "обращаемся к серверу..."
-            log(self.name, "Обращаемся к серверу (git fetch)...")
+        if self.problem is not None:
+            log(self.name, "Проверка не запущена: репозиторий в состоянии «Проблема» — ждём «Повторить проверку»")
+            return
 
-            try:
-                git_ops.fetch(self.repo_path)
-                # Смотрим тег именно на origin/<branch> (реально то, что на git ПОСЛЕ fetch), а
-                # не на локальной ветке — fetch сам по себе локальную ветку не двигает, поэтому
-                # раньше здесь можно было увидеть устаревший тег и решить, что "версии совпали",
-                # хотя реально git уже ушёл вперёд (или наоборот).
-                git_version = git_ops.latest_tag_on_branch(self.repo_path, f"origin/{self.branch}")
-            except git_ops.GitError as e:
-                self._action_error_connection(reason, e)
-                return
+        # Не ждём блокировку молча (раньше поток просто вставал в очередь навсегда, если
+        # предыдущая проверка зависла, и в журнале была только тишина) — если проверка уже идёт,
+        # пишем, с какого времени и на каком этапе, и выходим. Событие файла при этом не
+        # теряется: ставим флаг, и сразу после текущей проверки запустится ещё одна.
+        if not self._lock.acquire(blocking=False):
+            if reason == REASON_PUSH:
+                self._recheck_requested = True
+            started = self.check_started_at
+            since = datetime.fromtimestamp(started).strftime("%H:%M:%S") if started else "?"
+            stage = self.check_stage or "?"
+            log(self.name, f"Проверка пропущена: предыдущая ещё идёт с {since}, этап — {stage}")
+            waiting_user = self.pending_question is not None
+            if started and not waiting_user and time.time() - started > self._HUNG_CHECK_SECONDS:
+                self.set_problem(
+                    f"проверка зависла: идёт с {since}, этап — {stage}. Если после «Повторить "
+                    f"проверку» снова так же — перезапустите программу."
+                )
+            return
 
-            self.current_tag = git_version or "тегов ещё нет"
+        outer = self.check_started_at is None  # False — повторный вход того же потока (RLock)
+        if outer:
+            self.check_started_at = time.time()
+        try:
+            self._sverka_versiy_locked(reason)
+        finally:
+            if outer:
+                self.check_started_at = None
+                self.set_stage("")
+            self._lock.release()
 
-            if git_version == self.known_version:
-                self._branch_matched(reason)
-                return
+        if outer and self._recheck_requested and self.problem is None:
+            self._recheck_requested = False
+            log(self.name, "Во время проверки были изменения файлов — проверяем ещё раз")
+            self.sverka_versiy(REASON_PUSH)
 
-            if self.known_version is not None and not git_ops.tag_exists(self.repo_path, self.known_version):
-                log(self.name, "Известная нам версия не найдена на git — расхождение, нужен выбор")
-                self._process_slияniya_raskhozhdeniy(reason)
-                return
+    def _sverka_versiy_locked(self, reason: str) -> None:
+        self.last_action = "обращаемся к серверу..."
+        self.set_stage("git fetch")
+        log(self.name, "Обращаемся к серверу (git fetch)...")
 
-            self._branch_git_ahead(reason, git_version)
+        try:
+            git_ops.fetch(self.repo_path)
+            # Смотрим тег именно на origin/<branch> (реально то, что на git ПОСЛЕ fetch), а
+            # не на локальной ветке — fetch сам по себе локальную ветку не двигает, поэтому
+            # раньше здесь можно было увидеть устаревший тег и решить, что "версии совпали",
+            # хотя реально git уже ушёл вперёд (или наоборот).
+            git_version = git_ops.latest_tag_on_branch(self.repo_path, f"origin/{self.branch}")
+        except git_ops.GitError as e:
+            self._action_error_connection(reason, e)
+            return
+
+        self.current_tag = git_version or "тегов ещё нет"
+
+        if git_version == self.known_version:
+            self._branch_matched(reason)
+            return
+
+        if self.known_version is not None and not git_ops.tag_exists(self.repo_path, self.known_version):
+            log(self.name, "Известная нам версия не найдена на git — расхождение, нужен выбор")
+            self._process_slияniya_raskhozhdeniy(reason)
+            return
+
+        self._branch_git_ahead(reason, git_version)
 
     def _branch_matched(self, reason: str) -> None:
         if not git_ops.has_local_changes(self.repo_path):
+            # Незакоммиченных изменений нет — но мог остаться локальный коммит, который так и не
+            # ушёл на git (например, пуш был отклонён). Раньше такой коммит считался "пуш не
+            # нужен" и висел только на компьютере бесконечно (GIT_Automation, коммит f7ff025,
+            # 26.09) — теперь отправляем его.
+            try:
+                ahead = git_ops.ahead_behind(self.repo_path, self.branch).ahead
+            except git_ops.GitError:
+                ahead = 0  # нет origin/<ветка> или другая ошибка — ведём себя как раньше
+            if ahead > 0:
+                log(self.name, f"Есть {ahead} локальн. коммит(ов), которых нет на git — отправляем")
+                self._action_push(reason)
+                return
             self.last_check_time = _now_str()
             self.last_action = "актуально, изменений нет"
             log(self.name, "Результат: локальных изменений не найдено, пуш не нужен")
@@ -416,6 +515,7 @@ class RepoWatcher(FileSystemEventHandler):
 
         self.last_action = "есть незафиксированные изменения — нужен ответ"
         log(self.name, "Найдены незафиксированные локальные изменения")
+        self.set_stage("ожидает ответа пользователя (запушить изменения?)")
         if app.ask_yes_no(self, f"[{self.name}] Есть незафиксированные изменения. Запушить их?"):
             self._action_push(reason)
         else:
@@ -427,6 +527,7 @@ class RepoWatcher(FileSystemEventHandler):
         if not git_ops.has_local_changes(self.repo_path):
             self.last_action = "на git есть более новая версия — нужен ответ"
             log(self.name, f"На git версия {git_version}, у нас {self.known_version} — нужен ответ")
+            self.set_stage("ожидает ответа пользователя (обновить с git?)")
             if app.ask_yes_no(self, f"[{self.name}] На git есть более новая версия {git_version}. Обновить локально?"):
                 self._action_update_local(git_version)
             else:
@@ -438,11 +539,12 @@ class RepoWatcher(FileSystemEventHandler):
             self._process_slияniya_raskhozhdeniy(reason)
 
     def _action_error_connection(self, reason: str, error: Exception) -> None:
-        self.last_check_time = _now_str()
-        self.last_action = "нет связи с git"
+        # Раньше здесь был блокирующий вопрос "Повторить попытку?", заданный ВНУТРИ проверки (с
+        # удержанием блокировки репозитория), а повтор вызывал sverka_versiy повторно изнутри.
+        # Теперь по общему правилу (26.09): проверка не прошла -> "Проблема", таймер остановлен,
+        # повтор — кнопкой "Повторить проверку" в окне.
         log(self.name, f"Результат: нет связи с git — {error}")
-        if app.ask_yes_no(self, f"[{self.name}] Нет связи с git. Повторить попытку?"):
-            self.sverka_versiy(reason)
+        self.set_problem(f"нет связи с git (git fetch не прошёл): {error}")
 
     def _action_update_local(self, git_version: str) -> None:
         git_ops.reset_hard(self.repo_path, f"origin/{self.branch}")
@@ -503,12 +605,10 @@ class RepoWatcher(FileSystemEventHandler):
             except git_ops.GitError as e:
                 # Не переключаем силой (без -f) — если мешают незакоммиченные изменения, лучше
                 # остановиться с понятной причиной, чем рискнуть чужими несохранёнными правками.
-                self.last_action = "не удалось переключить ветку"
-                log(
-                    self.name,
-                    f"ОСТАНОВЛЕНО: не удалось автоматически переключиться на ветку {self.branch!r}: "
-                    f"{e}\nВозможно, мешают незакоммиченные изменения на ветке {checked_out!r} — "
-                    f"разберитесь с ними вручную и повторите.",
+                self.set_problem(
+                    f"не удалось автоматически переключиться на ветку {self.branch!r}: {e}\n"
+                    f"Возможно, мешают незакоммиченные изменения на ветке {checked_out!r} — "
+                    f"разберитесь с ними вручную и нажмите «Повторить проверку»."
                 )
                 return
             log(self.name, f"Переключились на ветку {self.branch!r}")
@@ -518,15 +618,14 @@ class RepoWatcher(FileSystemEventHandler):
             # проскочить в коммит именно на той ветке, куда мы только что переключились.
             self._ensure_gitignore_protection()
 
+        self.set_stage("commit")
         try:
             changed = git_ops.changed_files(self.repo_path)
             if changed:
                 log(self.name, "Файлы, которые считаются материалом для пуша:\n" + "\n".join(changed))
                 git_ops.add_commit(self.repo_path, ["."], message=reason)
         except git_ops.GitError as e:
-            self.last_check_time = _now_str()
-            self.last_action = "ошибка коммита"
-            log(self.name, f"Результат: ошибка при коммите — {e}")
+            self.set_problem(f"ошибка при коммите: {e}")
             return
 
         # Версия — это просто префикс (любой текст) + свой номер пуша (version.py). При ручном
@@ -550,30 +649,94 @@ class RepoWatcher(FileSystemEventHandler):
         # кончились 50 попыток на свободный номер), и тогда коммит оставался на GitHub БЕЗ
         # версии. Это прямо запрещено: код без тега на сервере появиться не должен ни при каких
         # обстоятельствах.
+        # Правила повторов (26.09, после "бесконечного пуша" в Godot_Template и GIT_Automation):
+        # раньше ЛЮБОЙ отказ push считался занятым тегом — тег удалялся, номер +1, и так 50 раз,
+        # а текст ошибки git нигде не показывался. Теперь:
+        # - текст ошибки git ВСЕГДА пишется в журнал;
+        # - номер тега растёт (+1) ТОЛЬКО если такой тег реально уже есть на git (а если он есть и
+        #   на компьютере — только если он совпадает с git, т.е. тоже есть на сервере);
+        # - при обрыве связи — повтор того же тега, не больше _PUSH_NETWORK_RETRIES раз, с паузой;
+        # - при любой другой причине (сервер отклонил ветку, защита GitHub и т.п.) — без повторов:
+        #   "Проблема", коммит остаётся локально, ждём "Повторить проверку".
+        self.set_stage("push")
         tag = None
-        for _ in range(50):
+        network_retries = 0
+        for _ in range(_PUSH_TAG_ATTEMPTS):
             candidate = version.build_tag(prefix, push_count)
+
+            if git_ops.tag_exists(self.repo_path, candidate):
+                # Тег с таким именем уже есть на компьютере. Номер растёт только если он есть и на
+                # git (значит, номер действительно занят). Тег только на компьютере — не
+                # синхронизирован с git: сами не удаляем и номер не двигаем, это решает пользователь.
+                try:
+                    on_git = git_ops.remote_tag_exists(self.repo_path, candidate)
+                except git_ops.GitError as e:
+                    self.set_problem(f"не удалось проверить тег {candidate} на git: {e}")
+                    return
+                if on_git:
+                    log(self.name, f"Тег {candidate} уже есть и на компьютере, и на git — берём следующий номер")
+                    push_count += 1
+                    continue
+                self.set_problem(
+                    f"тег {candidate} есть только на компьютере и не синхронизирован с git "
+                    f"(остался от неудачного пуша?). Удалите его (git tag -d {candidate}) или "
+                    f"отправьте вручную, затем «Повторить проверку»."
+                )
+                return
+
             try:
                 git_ops.create_tag(self.repo_path, candidate, message=reason)
-            except git_ops.GitError:
-                push_count += 1  # локальная коллизия имени тега — пробуем следующий номер
-                continue
+            except git_ops.GitError as e:
+                self.set_problem(f"не удалось создать тег {candidate}: {e}")
+                return
+
             try:
                 git_ops.push_atomic(self.repo_path, self.branch, candidate, force=force)
                 tag = candidate
                 break
-            except git_ops.GitError:
-                # Атомарный пуш отклонён целиком — локальный тег убираем (иначе он будет мешать
-                # следующей попытке) и пробуем следующий номер.
+            except git_ops.GitError as e:
+                # Атомарный пуш отклонён целиком — на сервер не ушло ничего. Локальный тег
+                # убираем, чтобы он не остался "не синхронизированным" с git.
                 git_ops.delete_local_tag(self.repo_path, candidate)
+                log(self.name, f"git push отклонён (тег {candidate}):\n{e}")
+                push_error = e
+
+            try:
+                taken_on_git = git_ops.remote_tag_exists(self.repo_path, candidate)
+            except git_ops.GitError:
+                taken_on_git = False  # сервер недоступен — ниже это распознается как обрыв связи
+
+            if taken_on_git:
+                log(self.name, f"Тег {candidate} уже занят на git — берём следующий номер")
                 push_count += 1
+                continue
+
+            if git_ops.is_connection_error(push_error):
+                network_retries += 1
+                if network_retries <= _PUSH_NETWORK_RETRIES:
+                    log(
+                        self.name,
+                        f"Похоже на обрыв связи — повтор {network_retries}/{_PUSH_NETWORK_RETRIES} "
+                        f"через {_PUSH_NETWORK_RETRY_PAUSE} с (тот же тег {candidate})",
+                    )
+                    time.sleep(_PUSH_NETWORK_RETRY_PAUSE)
+                    continue
+                self.set_problem(
+                    f"нет связи с git — пуш не прошёл после {_PUSH_NETWORK_RETRIES} повторов. "
+                    f"Коммит остался только на компьютере. Последняя ошибка git:\n{push_error}"
+                )
+                return
+
+            self.set_problem(
+                "git отклонил пуш (не из-за занятого тега и не из-за связи — повтор не поможет). "
+                f"Коммит остался только на компьютере. Ошибка git:\n{push_error}"
+            )
+            return
+
         if tag is None:
-            self.last_check_time = _now_str()
-            self.last_action = "ошибка коммита/пуша"
-            log(
-                self.name,
-                "Результат: атомарный пуш (код+тег) не удался за 50 попыток — на сервер НЕ "
-                "ушло ничего, код остался только локально до следующей попытки",
+            self.set_problem(
+                f"не нашлось свободного номера тега за {_PUSH_TAG_ATTEMPTS} попыток — на сервер "
+                f"не ушло ничего, коммит остался только на компьютере"
             )
             return
 
@@ -595,8 +758,7 @@ class RepoWatcher(FileSystemEventHandler):
             local_head = git_ops.rev_parse(self.repo_path, "HEAD")
             remote_head = git_ops.rev_parse(self.repo_path, f"origin/{self.branch}")
         except git_ops.GitError as e:
-            self.last_action = "ошибка проверки после пуша"
-            log(self.name, f"Результат: пуш прошёл, но проверка после пуша не удалась — {e}")
+            self.set_problem(f"пуш прошёл, но проверка после пуша не удалась: {e}")
             return
 
         if local_head == remote_head and not git_ops.has_local_changes(self.repo_path):
@@ -612,6 +774,7 @@ class RepoWatcher(FileSystemEventHandler):
     def _process_slияniya_raskhozhdeniy(self, reason: str) -> None:
         self.last_action = "расхождение — нужен выбор"
         diff = git_ops.diff_name_status(self.repo_path, self.branch, f"origin/{self.branch}")
+        self.set_stage("ожидает ответа пользователя (расхождение с git)")
         choice = app.ask_choice(self, self.branch, diff)
 
         if choice == notifier.SyncChoice.TAKE_LOCAL:
@@ -633,6 +796,7 @@ class RepoWatcher(FileSystemEventHandler):
                     "скорее всего, откроется и сразу закроется сам (показывать нечего). Это не "
                     "ошибка mergetool — открываем его всё равно, на случай если git считает иначе.",
                 )
+            self.set_stage("открыт mergetool")
             git_ops.open_mergetool(self.repo_path)
             log(self.name, "Mergetool закрыт — перепроверяем состояние")
 
@@ -666,10 +830,29 @@ def add_repo_runtime(repo_cfg: dict, interval_seconds: int):
     _save_config()
 
     watcher = RepoWatcher(repo_cfg, cfg["dev_id"], interval_seconds)
-    _register_watch(watcher)
+    # Постановка слежения (observer.schedule) и первичная проверка — в фоне, а не прямо здесь.
+    # Эта функция вызывается из главного потока окна (кнопка 'Добавить' в диалоге '+'), и раньше
+    # _register_watch выполнялся прямо в нём: observer.schedule берёт внутреннюю блокировку
+    # watchdog, которую в этот момент может держать поток другого репозитория (например, стоящий
+    # внутри unschedule в ожидании git-операции или ответа на диалог) — и тогда зависало ВСЁ окно
+    # целиком. Та же причина и то же решение, что у set_repo_running_runtime/delete_repo_runtime.
     log(watcher.name, "Репозиторий добавлен — первичная проверка...")
-    threading.Thread(target=watcher.sverka_versiy, args=(REASON_START,), daemon=True).start()
+    threading.Thread(target=_register_watch_and_check, args=(watcher,), daemon=True).start()
     return watcher
+
+
+def _register_watch_and_check(watcher: RepoWatcher) -> None:
+    _register_watch(watcher)
+    watcher.sverka_versiy(REASON_START)
+
+
+def _rewatch(watcher: RepoWatcher) -> None:
+    """Снять старое слежение и поставить новое (после смены пути/папки слежения). Вызывается только
+    в фоновом потоке — см. комментарий в edit_repo_runtime. _unregister_watch снимает именно те
+    watch-объекты, что были поставлены раньше (watcher._observed_watches), поэтому поля
+    repo_path/watch_paths к этому моменту уже можно было поменять на новые."""
+    _unregister_watch(watcher)
+    _register_watch(watcher)
 
 
 def edit_repo_runtime(watcher: RepoWatcher, name: Optional[str] = None, path: Optional[str] = None,
@@ -683,8 +866,6 @@ def edit_repo_runtime(watcher: RepoWatcher, name: Optional[str] = None, path: Op
             continue
 
         needs_rewatch = bool(path) or (watch_path is not None)
-        if needs_rewatch:
-            _unregister_watch(watcher)
 
         if name and name != old_name:
             watcher.name = name
@@ -715,7 +896,13 @@ def edit_repo_runtime(watcher: RepoWatcher, name: Optional[str] = None, path: Op
             repo_cfg["check_interval_minutes"] = round(interval_seconds / 60)
 
         if needs_rewatch:
-            _register_watch(watcher)
+            # Пере-регистрация слежения — в фоне, а не прямо здесь. Эта функция вызывается из
+            # главного потока окна (диалоги 'Изменить...'), а observer.unschedule останавливает и
+            # ДОЖИДАЕТСЯ (join) поток-эмиттер этого репозитория. Если у репозитория в этот момент
+            # шла git-операция или был открыт диалог с вопросом пользователю, join() не завершался,
+            # и зависало ВСЁ окно — 'изменил путь репозитория — программа зависла'. Та же причина
+            # и то же решение, что у set_repo_running_runtime/delete_repo_runtime.
+            threading.Thread(target=_rewatch, args=(watcher,), daemon=True).start()
         break
     _save_config()
     watcher._save_repo_data()
@@ -788,6 +975,17 @@ def manual_version_change_runtime(watcher: RepoWatcher, new_prefix: str) -> None
     threading.Thread(target=watcher.manual_set_version, args=(new_prefix,), daemon=True).start()
 
 
+def retry_check_runtime(watcher: RepoWatcher) -> None:
+    """Кнопка "Повторить проверку" в окне — снимаем состояние "Проблема", перезапускаем таймер и
+    сразу проверяем (в фоне, чтобы не подвешивать окно на время git-операций)."""
+    watcher.problem = None
+    watcher.next_check_at = time.time() + watcher.check_interval_seconds
+    threading.Thread(
+        target=_run_check, args=(watcher, REASON_PUSH, "Повторная проверка по запросу пользователя..."),
+        daemon=True,
+    ).start()
+
+
 def _run_check(w: "RepoWatcher", reason: str, start_message: str) -> None:
     log(w.name, start_message)
     w.sverka_versiy(reason)
@@ -806,6 +1004,8 @@ def periodic_check_loop(watchers: list) -> None:
         for w in watchers:
             if not w.running:
                 continue  # остановлен пользователем — пропускаем, таймер не двигаем
+            if w.problem is not None:
+                continue  # "Проблема" — таймер стоит до "Повторить проверку" (retry_check_runtime)
             if now >= w.next_check_at:
                 w.next_check_at = now + w.check_interval_seconds
                 threading.Thread(
@@ -892,6 +1092,22 @@ def _run_self_update_check() -> None:
     self_update.check_and_apply(ask_yes_no, notify_and_exit, log_update_step)
 
 
+# Дефолтный config.json для СОВСЕМ первого запуска (config.json ещё нет — например, только что
+# склонировали репозиторий, а он намеренно свой для каждого компьютера). Раньше в этом случае
+# программа просто падала с FileNotFoundError (см. Save/autosync_crash.log Beta-копии). Теперь
+# сами создаём конфиг БЕЗ сталкеров (repos пустой) — только общие настройки, без которых main()
+# не запустится, — открываем пустое окно, пишем подсказку в журнал внизу окна и сразу открываем
+# форму "Добавить репозиторий". Код восстановлен из Beta-коммита c988ee5 (23.09), который был
+# потерян при reset --hard Beta на alpha/Mzs7; подсказка в журнале добавлена 26.09.
+_FIRST_RUN_DEFAULT_CONFIG = {
+    "_комментарий": "Создано автоматически при первом запуске (config.json не найден).",
+    "dev_id": 1,
+    "check_interval_minutes": 30,
+    "ignored_folders": [".godot", "__pycache__"],
+    "repos": [],
+}
+
+
 def main(config_path_: Optional[str] = None) -> None:
     global app, observer, cfg, config_path
     if config_path_ is None:
@@ -903,7 +1119,15 @@ def main(config_path_: Optional[str] = None) -> None:
         # config.json и падала с FileNotFoundError.
         config_path_ = str(Path(__file__).resolve().parent.parent / "Save" / "config.json")
     config_path = config_path_
-    cfg = json.loads(Path(config_path).read_text(encoding="utf-8"))
+
+    is_first_run = not Path(config_path).exists()
+    if is_first_run:
+        # Копия через json — чтобы вложенные списки (ignored_folders, repos) не были общими с
+        # константой и последующие добавления репозиториев её не меняли.
+        cfg = json.loads(json.dumps(_FIRST_RUN_DEFAULT_CONFIG))
+        _save_config()
+    else:
+        cfg = json.loads(Path(config_path).read_text(encoding="utf-8"))
     dev_id = cfg["dev_id"]
     # config.json по-прежнему хранит интервал в минутах (не переписываем формат файла) — окно и
     # все интерактивные диалоги дальше работают в секундах, переводим только один раз здесь.
@@ -937,7 +1161,19 @@ def main(config_path_: Optional[str] = None) -> None:
         on_manual_version_change=manual_version_change_runtime,
         on_toggle_run=set_repo_running_runtime,
         on_delete_repo=delete_repo_runtime,
+        on_retry_check=retry_check_runtime,
     )
+
+    if is_first_run:
+        log(
+            "AutoSync",
+            "Файл config.json не найден — создан новый, без сталкеров. Добавьте репозиторий "
+            "(кнопка \"+\" или открывшаяся форма) — слежение за ним начнётся сразу после добавления.",
+        )
+        # Небольшая задержка — чтобы главное окно успело отрисоваться ДО того, как поверх него
+        # появится диалог "Добавить репозиторий" (иначе на некоторых сборках Windows/tkinter
+        # диалог может открыться раньше самого окна и выглядеть "повисшим в воздухе").
+        app.root.after(300, app._open_add_dialog)
 
     # Слежение и проверки идут в фоне, окно — на главном потоке (обязательное требование tkinter).
     threading.Thread(target=_background_start, args=(watchers,), daemon=True).start()

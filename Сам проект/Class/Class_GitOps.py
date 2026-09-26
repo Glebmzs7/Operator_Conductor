@@ -143,6 +143,44 @@ def tag_exists(repo_path: Path, tag: str) -> bool:
     return bool(out)
 
 
+def remote_tag_exists(repo_path: Path, tag: str, remote: str = "origin") -> bool:
+    """Есть ли тег с таким именем на сервере (git ls-remote). Бросает GitError, если сервер
+    недоступен — вызывающий код сам решает, считать ли это обрывом связи."""
+    out = _run(repo_path, "ls-remote", "--tags", remote, f"refs/tags/{tag}")
+    return bool(out)
+
+
+# Фрагменты текста ошибок git, по которым видно, что это обрыв/отсутствие связи, а не отказ
+# сервера по существу (только в этом случае повтор той же команды может помочь).
+_CONNECTION_ERROR_MARKERS = (
+    "could not resolve host",
+    "unable to access",
+    "failed to connect",
+    "couldn't connect to server",
+    "connection timed out",
+    "operation timed out",
+    "timed out",
+    "connection reset",
+    "connection was reset",
+    "connection refused",
+    "network is unreachable",
+    "early eof",
+    "rpc failed",
+    "the remote end hung up unexpectedly",
+    "recv failure",
+    "send failure",
+    "empty reply from server",
+    "ssl_read",
+    "schannel",
+    "the requested url returned error: 50",
+)
+
+
+def is_connection_error(error: Exception) -> bool:
+    text = str(error).lower()
+    return any(marker in text for marker in _CONNECTION_ERROR_MARKERS)
+
+
 def create_and_push_tag(repo_path: Path, tag: str, message: str, remote: str = "origin") -> None:
     if tag_exists(repo_path, tag):
         # Коллизия версии (см. п.1.2.2 обсуждения) — git сам отказывает на дубликат тега,

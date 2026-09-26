@@ -342,6 +342,10 @@ class RepoRow(tk.Frame):
             # Жёлтое состояние — это не переключатель, а напоминание об открытом вопросе: клик
             # открывает тот же диалог заново, ровно как клик по красной строке.
             self.app.reopen_pending(w)
+        elif w.problem is not None:
+            # Оранжевое "Проблема" — проверка не прошла, таймер стоит: клик показывает причину и
+            # кнопку "Повторить проверку".
+            self.app.show_problem(w)
         elif w.running:
             self.app.on_toggle_run(w, False)
         else:
@@ -350,9 +354,13 @@ class RepoRow(tk.Frame):
     def _row_click(self, _event=None) -> None:
         if self.watcher.pending_question is not None:
             self.app.reopen_pending(self.watcher)
+        elif self.watcher.problem is not None:
+            self.app.show_problem(self.watcher)
 
     def _row_menu(self, event) -> None:
         menu = tk.Menu(self, tearoff=0)
+        if self.watcher.problem is not None:
+            menu.add_command(label="Повторить проверку", command=lambda: self.app.retry_check(self.watcher))
         menu.add_command(label="Изменить репозиторий...", command=self._edit_repo_full)
         menu.tk_popup(event.x_root, event.y_root)
 
@@ -470,12 +478,15 @@ class RepoRow(tk.Frame):
         self.saved_label.configure(text=w.last_saved_at)
         remaining = max(0, int(w.next_check_at - time.time()))
         mm, ss = divmod(remaining, 60)
-        self.countdown_label.configure(text=f"{mm:02d}:{ss:02d}" if w.running else "—:—")
+        timer_on = w.running and w.problem is None  # при "Проблеме" таймер стоит
+        self.countdown_label.configure(text=f"{mm:02d}:{ss:02d}" if timer_on else "—:—")
         self.status_label.configure(text=f"{w.last_action} ({w.last_check_time})")
 
-        needs_attention = w.pending_question is not None
-        if needs_attention:
+        needs_attention = w.pending_question is not None or w.problem is not None
+        if w.pending_question is not None:
             self.run_button.configure(text="Ожидает", bg="#f6c343", activebackground="#f6c343")
+        elif w.problem is not None:
+            self.run_button.configure(text="Проблема", bg="#e8833a", activebackground="#e8833a")
         elif w.running:
             self.run_button.configure(text="Работает", bg="#4caf50", activebackground="#4caf50")
         else:
@@ -492,13 +503,15 @@ class AutoSyncGUI:
                  on_edit_repo: Callable[..., None],
                  on_manual_version_change: Callable[..., None],
                  on_toggle_run: Callable[..., None],
-                 on_delete_repo: Callable[..., None]):
+                 on_delete_repo: Callable[..., None],
+                 on_retry_check: Optional[Callable[..., None]] = None):
         self.watchers = watchers
         self._on_add_repo_cb = on_add_repo
         self._on_edit_repo_cb = on_edit_repo
         self._on_manual_version_change_cb = on_manual_version_change
         self._on_toggle_run_cb = on_toggle_run
         self._on_delete_repo_cb = on_delete_repo
+        self._on_retry_check_cb = on_retry_check
 
         self.root = tk.Tk()
         self.root.title("AutoSync")
@@ -804,7 +817,7 @@ class AutoSyncGUI:
             row = self._rows.get(id(w))
             if row is None:
                 continue
-            show = (not self.filter_mode) or (w.pending_question is not None)
+            show = (not self.filter_mode) or (w.pending_question is not None) or (w.problem is not None)
             if show:
                 row.pack(fill="x", padx=6, pady=3)
             else:
@@ -885,6 +898,39 @@ class AutoSyncGUI:
     def on_delete_repo(self, watcher) -> None:
         self._on_delete_repo_cb(watcher)
 
+    def retry_check(self, watcher) -> None:
+        if self._on_retry_check_cb is not None:
+            self._on_retry_check_cb(watcher)
+
+    def show_problem(self, watcher) -> None:
+        """Окно с причиной "Проблемы" (проверка не прошла, таймер репозитория остановлен) и
+        кнопкой "Повторить проверку". Сам по себе ничего не блокирует — в отличие от вопросов
+        ask_yes_no/ask_choice, фоновый поток проверки его не ждёт."""
+        if watcher.problem is None:
+            return
+        win = tk.Toplevel(self.root)
+        win.title(f"AutoSync — проблема: {watcher.name}")
+        win.transient(self.root)
+        tk.Label(
+            win, text="Проверка не прошла — таймер и слежение для этого репозитория остановлены.",
+            font=("TkDefaultFont", 9, "bold"), justify="left",
+        ).pack(padx=16, pady=(16, 6), anchor="w")
+        text = tk.Text(win, wrap="word", width=80, height=12)
+        text.insert("1.0", watcher.problem)
+        # Текст можно выделить и скопировать (например, чтобы переслать ошибку git); правка его
+        # ни на что не влияет — это только копия watcher.problem для показа.
+        text.pack(padx=16, pady=(0, 8), fill="both", expand=True)
+        buttons = tk.Frame(win)
+        buttons.pack(pady=(0, 12))
+
+        def retry():
+            win.destroy()
+            self.retry_check(watcher)
+
+        tk.Button(buttons, text="Повторить проверку", command=retry).pack(side="left", padx=6)
+        tk.Button(buttons, text="Закрыть", command=win.destroy).pack(side="left", padx=6)
+        _finalize_toplevel(win)
+
     def remove_row_for(self, watcher) -> None:
         """Вызывается из фонового потока (watcher.py: delete_repo_runtime) после того, как
         слежение снято — сама уборка виджета и списка watchers идёт в главном потоке."""
@@ -898,7 +944,9 @@ class AutoSyncGUI:
             self.watchers.remove(watcher)
 
     def _tick(self) -> None:
-        pending_count = sum(1 for w in self.watchers if w.pending_question is not None)
+        pending_count = sum(
+            1 for w in self.watchers if w.pending_question is not None or w.problem is not None
+        )
         # Раньше при 0 проблем кнопка вообще исчезала ("ПРОБЛЕМЫ (0)" не было видно совсем) —
         # теперь кнопка всегда на месте, просто со счётчиком.
         self.alert_button.configure(text=f"ПРОБЛЕМЫ ({pending_count})")
