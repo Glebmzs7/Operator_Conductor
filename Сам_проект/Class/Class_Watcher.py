@@ -479,6 +479,16 @@ class RepoWatcher(FileSystemEventHandler):
 
         self.current_tag = git_version or "тегов ещё нет"
 
+        # Сначала — расхождение ветки слежения (11.10.2026): если на диске открыта не та ветка,
+        # сравнивать версии бессмысленно — сравнивали бы чужую ветку с нашей.
+        try:
+            checked_out = git_ops.current_branch(self.repo_path)
+        except git_ops.GitError:
+            checked_out = None
+        if checked_out not in (None, "HEAD", self.branch):
+            self._resolve_branch_mismatch(checked_out, reason)
+            return
+
         if git_version == self.known_version:
             self._branch_matched(reason)
             return
@@ -524,19 +534,11 @@ class RepoWatcher(FileSystemEventHandler):
             log(self.name, "Пользователь отложил пуш")
 
     def _branch_git_ahead(self, reason: str, git_version: Optional[str]) -> None:
-        if not git_ops.has_local_changes(self.repo_path):
-            self.last_action = "на git есть более новая версия — нужен ответ"
-            log(self.name, f"На git версия {git_version}, у нас {self.known_version} — нужен ответ")
-            self.set_stage("ожидает ответа пользователя (обновить с git?)")
-            if app.ask_yes_no(self, f"[{self.name}] На git есть более новая версия {git_version}. Обновить локально?"):
-                self._action_update_local(git_version)
-            else:
-                self.last_check_time = _now_str()
-                self.last_action = "есть новая версия на git, обновление отложено"
-                log(self.name, "Пользователь отложил обновление")
-        else:
-            log(self.name, "На git есть новая версия, и локально тоже есть изменения — нужен выбор")
-            self._process_slияniya_raskhozhdeniy(reason)
+        # На git версия не та, что мы знаем. Раньше здесь было два своих случая (вопрос "обновить?"
+        # или окно расхождения); с 11.10.2026 всё решает единая сверка версий по схеме
+        # пользователя — см. _process_slияniya_raskhozhdeniy.
+        log(self.name, f"На git версия {git_version}, у нас {self.known_version} — сверка версий")
+        self._process_slияniya_raskhozhdeniy(reason)
 
     def _action_error_connection(self, reason: str, error: Exception) -> None:
         # Раньше здесь был блокирующий вопрос "Повторить попытку?", заданный ВНУТРИ проверки (с
@@ -546,9 +548,10 @@ class RepoWatcher(FileSystemEventHandler):
         log(self.name, f"Результат: нет связи с git — {error}")
         self.set_problem(f"нет связи с git (git fetch не прошёл): {error}")
 
-    def _action_update_local(self, git_version: str) -> None:
+    def _action_update_local(self, git_version: Optional[str]) -> None:
         git_ops.reset_hard(self.repo_path, f"origin/{self.branch}")
-        self._accept_version(git_version)
+        if git_version:  # на git может ещё не быть ни одного тега
+            self._accept_version(git_version)
         self.last_check_time = _now_str()
         self.last_action = "обновлено с git"
         log(self.name, f"Результат: обновлено с git до {git_version}")
@@ -595,28 +598,12 @@ class RepoWatcher(FileSystemEventHandler):
             checked_out = None
             log(self.name, f"Не удалось определить текущую ветку рабочей копии: {e}")
         if checked_out is not None and checked_out != self.branch:
-            log(
-                self.name,
-                f"В рабочей копии на диске переключена ветка {checked_out!r}, а не {self.branch!r} "
-                f"(та, за которой следит AutoSync) — переключаем автоматически...",
-            )
-            try:
-                git_ops.checkout(self.repo_path, self.branch)
-            except git_ops.GitError as e:
-                # Не переключаем силой (без -f) — если мешают незакоммиченные изменения, лучше
-                # остановиться с понятной причиной, чем рискнуть чужими несохранёнными правками.
-                self.set_problem(
-                    f"не удалось автоматически переключиться на ветку {self.branch!r}: {e}\n"
-                    f"Возможно, мешают незакоммиченные изменения на ветке {checked_out!r} — "
-                    f"разберитесь с ними вручную и нажмите «Повторить проверку»."
-                )
-                return
-            log(self.name, f"Переключились на ветку {self.branch!r}")
-            # .gitignore/индекс проверялись при старте программы на ТОЙ ветке, что тогда была
-            # текущей — после переключения сюда нужна та же проверка заново, на актуальной ветке
-            # (см. подробности в _ensure_gitignore_protection), иначе .autosync_data может
-            # проскочить в коммит именно на той ветке, куда мы только что переключились.
-            self._ensure_gitignore_protection()
+            # Расхождение ветки слежения (исправлено 11.10.2026). Раньше здесь AutoSync молча
+            # делал git checkout на отслеживаемую ветку — если она была устаревшей, файлы на
+            # диске откатывались, а следующий пуш закреплял откат на GitHub (Power_struggle,
+            # 25.09). Теперь — вопрос пользователю, какая ветка правильная.
+            self._resolve_branch_mismatch(checked_out, reason)
+            return
 
         self.set_stage("commit")
         try:
@@ -771,36 +758,197 @@ class RepoWatcher(FileSystemEventHandler):
             log(self.name, "После пуша версия/файлы не совпали с ожиданием — уходим в слияние")
             self._process_slияniya_raskhozhdeniy(reason)
 
-    def _process_slияniya_raskhozhdeniy(self, reason: str) -> None:
-        self.last_action = "расхождение — нужен выбор"
-        diff = git_ops.diff_name_status(self.repo_path, self.branch, f"origin/{self.branch}")
-        self.set_stage("ожидает ответа пользователя (расхождение с git)")
-        choice = app.ask_choice(self, self.branch, diff)
+    # --- Расхождение ветки слежения (11.10.2026) -------------------------------------------
 
-        if choice == notifier.SyncChoice.TAKE_LOCAL:
-            log(self.name, "Выбор пользователя: оставить локальную версию (force-push)")
-            self._action_push(reason, force=True)
+    def _resolve_branch_mismatch(self, disk_branch: str, reason: str) -> None:
+        """На диске открыта ветка disk_branch, а AutoSync следит за self.branch. Спрашиваем, какая
+        правильная:
+        - "disk"    — оставляем ветку с диска: меняем ветку слежения в config.json и
+                      .autosync_data (edit_repo_runtime) и проверяем заново, как обычно;
+        - "tracked" — переходим на указанную ветку, НЕ трогая файлы на диске (коммиты старой
+                      ветки остаются в ней), и сразу сверка версий (_process_slияniya_raskhozhdeniy)."""
+        tracked = self.branch
+        log(
+            self.name,
+            f"Расхождение ветки слежения: на диске ветка {disk_branch!r}, AutoSync следит за "
+            f"{tracked!r} — нужен выбор",
+        )
+        try:
+            remote_ref = f"origin/{tracked}"
+            if git_ops.ref_exists(self.repo_path, remote_ref):
+                tracked_ref = remote_ref
+            elif git_ops.ref_exists(self.repo_path, f"refs/heads/{tracked}"):
+                tracked_ref = tracked
+            else:
+                tracked_ref = None
+            dirty = git_ops.has_local_changes(self.repo_path)
+            disk_label = git_ops.tag_label(self.repo_path, "HEAD", dirty=dirty)
+            if tracked_ref is not None:
+                tracked_label = git_ops.tag_label(self.repo_path, tracked_ref)
+                commits = git_ops.commits_not_in(self.repo_path, tracked_ref, "HEAD")
+            else:
+                tracked_label = "ветки ещё нет"
+                commits = []
+        except git_ops.GitError as e:
+            self.set_problem(f"не удалось сравнить ветки {disk_branch!r} и {tracked!r}: {e}")
             return
-        elif choice == notifier.SyncChoice.TAKE_GIT:
-            log(self.name, "Выбор пользователя: взять версию с git")
-            git_version = git_ops.latest_tag_on_branch(self.repo_path, f"origin/{self.branch}")
-            if git_version:
-                self._action_update_local(git_version)
-        else:
-            log(self.name, "Выбор пользователя: открыть mergetool")
-            unmerged = git_ops.unmerged_files(self.repo_path)
-            if not unmerged:
-                log(
-                    self.name,
-                    "Внимание: git не видит файлов в состоянии реального конфликта — mergetool, "
-                    "скорее всего, откроется и сразу закроется сам (показывать нечего). Это не "
-                    "ошибка mergetool — открываем его всё равно, на случай если git считает иначе.",
-                )
+
+        self.last_action = "расхождение ветки слежения — нужен выбор"
+        self.set_stage("ожидает ответа пользователя (расхождение ветки слежения)")
+        choice = app.ask_branch_mismatch(self, disk_branch, tracked, disk_label, tracked_label, commits)
+
+        if choice == "disk":
+            log(self.name, f"Выбор пользователя: оставить ветку с диска {disk_branch!r} — меняем ветку слежения")
+            edit_repo_runtime(self, branch=disk_branch)
+            self.sverka_versiy(REASON_START)
+            return
+
+        log(self.name, f"Выбор пользователя: перейти на {tracked!r} — файлы с диска идут в сверку версий")
+        try:
+            git_ops.switch_branch_keep_files(self.repo_path, tracked)
+        except git_ops.GitError as e:
+            self.set_problem(f"не удалось перейти на ветку {tracked!r}: {e}")
+            return
+        self._ensure_gitignore_protection()
+        self._process_slияniya_raskhozhdeniy(reason)
+
+    # --- Расхождение версий одной ветки (11.10.2026) ----------------------------------------
+
+    def _process_slияniya_raskhozhdeniy(self, reason: str) -> None:
+        """Сверка версий по схеме пользователя:
+        1. Есть ли версия с диска (HEAD) в ветке на git?
+           - да: есть ли отличия (незакоммиченные изменения)?
+             - нет  -> предложить обновить до актуальной версии с git;
+             - да   -> окно с тремя стандартными вариантами;
+           - нет  -> окно с тремя стандартными вариантами.
+        Три варианта: "Взять всё с git", "Отправить нашу версию как основную" (новый коммит поверх
+        git, без force-push), "Избирательно" (слияние + mergetool). Ничего не теряется: свои
+        коммиты перед заменой сохраняются в ветке autosync-backup/..., незакоммиченные
+        изменения — в git stash."""
+        remote_ref = f"origin/{self.branch}"
+        try:
+            if not git_ops.ref_exists(self.repo_path, remote_ref):
+                log(self.name, f"Ветки {self.branch!r} ещё нет на git — отправляем её")
+                self._action_push(reason)
+                return
+
+            dirty = git_ops.has_local_changes(self.repo_path)
+            in_git = git_ops.is_ancestor(self.repo_path, "HEAD", remote_ref)
+            local_label = git_ops.tag_label(self.repo_path, "HEAD", dirty=dirty)
+            git_label = git_ops.tag_label(self.repo_path, remote_ref)
+            git_version = git_ops.latest_tag_on_branch(self.repo_path, remote_ref)
+
+            if in_git and not dirty:
+                local_head = git_ops.rev_parse(self.repo_path, "HEAD")
+                remote_head = git_ops.rev_parse(self.repo_path, remote_ref)
+                if local_head == remote_head:
+                    # Файлы совпадают с git, разошлась только запомненная версия — принимаем.
+                    if git_version:
+                        self._accept_version(git_version)
+                    self.last_check_time = _now_str()
+                    self.last_action = "актуально, совпадает с git"
+                    log(self.name, f"Результат: на диске ровно версия с git ({git_label}) — принята")
+                    return
+                self.last_action = "на git есть более новая версия — нужен ответ"
+                self.set_stage("ожидает ответа пользователя (обновить до актуальной?)")
+                if app.ask_yes_no(
+                    self,
+                    f"[{self.name}] Версия на диске ({local_label}) есть на git, своих изменений нет. "
+                    f"На git более новая версия {git_label}. Обновить до актуальной?",
+                ):
+                    self._action_update_local(git_version)
+                else:
+                    self.last_check_time = _now_str()
+                    self.last_action = "есть новая версия на git, обновление отложено"
+                    log(self.name, "Пользователь отложил обновление")
+                return
+
+            ours = git_ops.commits_not_in(self.repo_path, remote_ref, "HEAD")
+            theirs = git_ops.commits_not_in(self.repo_path, "HEAD", remote_ref)
+            facts = [
+                f"Версия на диске ({local_label}) " + ("есть на git." if in_git else "НЕ найдена в ветке на git."),
+            ]
+            if ours:
+                facts.append(f"На диске {len(ours)} коммит(ов), которых нет на git.")
+            if dirty:
+                facts.append("На диске есть незакоммиченные изменения.")
+            if theirs:
+                facts.append(f"На git {len(theirs)} коммит(ов), которых нет на диске (версия {git_label}).")
+            situation = f"Расхождение версий в ветке {self.branch!r}.\n" + "\n".join(facts)
+            diff = git_ops.diff_worktree_name_status(self.repo_path, remote_ref)
+        except git_ops.GitError as e:
+            self.set_problem(f"не удалось сравнить версию на диске с git: {e}")
+            return
+
+        log(self.name, situation.replace("\n", " "))
+        self.last_action = "расхождение версий — нужен выбор"
+        self.set_stage("ожидает ответа пользователя (расхождение версий)")
+        choice = app.ask_choice(self, self.branch, diff, situation, local_label, git_label)
+
+        try:
+            if choice == notifier.SyncChoice.TAKE_GIT:
+                log(self.name, "Выбор пользователя: взять всё с git")
+                self._take_all_from_git(remote_ref, bool(ours), git_version)
+            elif choice == notifier.SyncChoice.TAKE_LOCAL:
+                log(self.name, "Выбор пользователя: отправить нашу версию как основную")
+                self._push_ours_as_main(remote_ref, bool(ours), reason)
+            else:
+                log(self.name, "Выбор пользователя: избирательно (слияние + mergetool)")
+                self._selective_merge(remote_ref, reason)
+        except git_ops.GitError as e:
+            self.set_problem(f"не удалось выполнить выбранный вариант: {e}")
+
+    def _backup_own_commits(self) -> None:
+        """Свои коммиты, которых нет на git, сохраняем в отдельной ветке перед тем, как убрать их из
+        текущей ветки — чтобы их всегда можно было вернуть."""
+        stamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+        backup = f"autosync-backup/{self.branch}-{stamp}"
+        git_ops.create_branch(self.repo_path, backup, "HEAD")
+        log(self.name, f"Свои коммиты сохранены в ветке {backup!r}")
+
+    def _take_all_from_git(self, remote_ref: str, has_own_commits: bool, git_version: Optional[str]) -> None:
+        if has_own_commits:
+            self._backup_own_commits()
+        stamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        if git_ops.stash_all(self.repo_path, f"AutoSync: перед «Взять всё с git» {stamp}"):
+            log(self.name, "Незакоммиченные изменения сохранены в git stash (git stash list)")
+        git_ops.reset_hard(self.repo_path, remote_ref)
+        if git_version:
+            self._accept_version(git_version)
+        self.last_check_time = _now_str()
+        self.last_action = "взято с git"
+        log(self.name, f"Результат: на диске версия с git ({git_version or 'без тега'})")
+
+    def _push_ours_as_main(self, remote_ref: str, has_own_commits: bool, reason: str) -> None:
+        """Наша версия как основная — БЕЗ force-push: файлы с диска становятся новым коммитом
+        поверх ветки на git, история на GitHub не переписывается."""
+        self.set_stage("commit")
+        git_ops.commit_all(self.repo_path, f"{reason}: изменения с диска (наша версия как основная)")
+        if not git_ops.is_ancestor(self.repo_path, remote_ref, "HEAD"):
+            if has_own_commits:
+                self._backup_own_commits()
+            sha = git_ops.commit_tree_on_top(
+                self.repo_path, remote_ref, f"{reason}: наша версия как основная (поверх {remote_ref})"
+            )
+            git_ops.move_current_branch_to(self.repo_path, sha)
+        self._action_push(reason)
+
+    def _selective_merge(self, remote_ref: str, reason: str) -> None:
+        self.set_stage("commit")
+        git_ops.commit_all(self.repo_path, f"{reason}: изменения с диска перед слиянием")
+        if not git_ops.merge_ref(self.repo_path, remote_ref):
             self.set_stage("открыт mergetool")
             git_ops.open_mergetool(self.repo_path)
-            log(self.name, "Mergetool закрыт — перепроверяем состояние")
-
-        self.sverka_versiy(REASON_START)
+            log(self.name, "Mergetool закрыт — проверяем, все ли конфликты решены")
+            left = git_ops.unmerged_files(self.repo_path)
+            if left:
+                self.set_problem(
+                    "слияние не завершено, остались конфликтующие файлы: " + ", ".join(left)
+                    + ". Решите их (git mergetool), сделайте git commit и нажмите «Повторить проверку»."
+                )
+                return
+            git_ops.finish_merge(self.repo_path)
+        self._action_push(reason)
 
 
 def _register_watch(watcher: RepoWatcher) -> None:

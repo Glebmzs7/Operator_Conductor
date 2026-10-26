@@ -273,3 +273,118 @@ def push_force_with_lease(repo_path: Path, branch: Optional[str] = None, remote:
     в последний раз его видели, вместо того чтобы затереть это молча."""
     branch = branch or current_branch(repo_path)
     _run(repo_path, "push", "--force-with-lease", remote, branch)
+
+
+# --- Расхождение ветки слежения и версий ветки (11.10.2026) ---------------------------------
+# Используются в Class_Watcher.py: _resolve_branch_mismatch (на диске не та ветка) и
+# _process_slияniya_raskhozhdeniy (версии одной ветки разошлись).
+
+def _run_rc(repo_path: Path, *args: str) -> int:
+    """Как _run, но возвращает код возврата вместо исключения — для команд, где ненулевой код
+    это ответ "нет", а не ошибка (git merge-base --is-ancestor, git rev-parse --verify)."""
+    _log_command(repo_path, " ".join(args))
+    result = subprocess.run(
+        ["git", "-C", str(repo_path), *args],
+        capture_output=True, text=True, encoding="utf-8", errors="replace",
+        creationflags=_NO_WINDOW_FLAGS,
+    )
+    return result.returncode
+
+
+def ref_exists(repo_path: Path, ref: str) -> bool:
+    return _run_rc(repo_path, "rev-parse", "--verify", "--quiet", f"{ref}^{{commit}}") == 0
+
+
+def is_ancestor(repo_path: Path, ancestor: str, descendant: str) -> bool:
+    """Есть ли коммит ancestor в истории descendant ("эта версия есть в ветке")."""
+    return _run_rc(repo_path, "merge-base", "--is-ancestor", ancestor, descendant) == 0
+
+
+def tag_label(repo_path: Path, ref: str, dirty: bool = False) -> str:
+    """Подпись для кнопки выбора: последний тег, достижимый из ref, и "+", если поверх этого
+    тега есть ещё коммиты (ref не стоит ровно на теге) или dirty=True (незакоммиченные
+    изменения на диске)."""
+    tag = latest_tag_on_branch(repo_path, ref)
+    if tag is None:
+        return "без тега" + ("+" if dirty else "")
+    exact = _run_rc(repo_path, "describe", "--tags", "--exact-match", ref) == 0
+    return tag + ("+" if (not exact or dirty) else "")
+
+
+def commits_not_in(repo_path: Path, base: str, head: str) -> List[str]:
+    """Коммиты, которые есть в head, но нет в base (git log --oneline base..head)."""
+    out = _run(repo_path, "log", "--oneline", f"{base}..{head}")
+    return out.splitlines() if out else []
+
+
+def diff_worktree_name_status(repo_path: Path, ref: str) -> List[str]:
+    """Какие файлы на диске (включая незакоммиченные изменения и новые файлы) отличаются от ref."""
+    out = _run(repo_path, "diff", "--name-status", ref)
+    lines = out.splitlines() if out else []
+    status = _run(repo_path, "status", "--porcelain")
+    lines += [line for line in (status.splitlines() if status else []) if line.startswith("??")]
+    return lines
+
+
+def switch_branch_keep_files(repo_path: Path, branch: str, remote: str = "origin") -> None:
+    """Переключить HEAD на branch, НЕ трогая файлы на диске: после этого файлы с диска видны как
+    изменения относительно branch и дальше идут в сверку версий. Коммиты старой ветки остаются
+    в ней. Если локальной branch нет — создаётся от <remote>/<branch>."""
+    if not ref_exists(repo_path, f"refs/heads/{branch}"):
+        if not ref_exists(repo_path, f"{remote}/{branch}"):
+            raise GitError(f"ветки {branch!r} нет ни на компьютере, ни на {remote}")
+        _run(repo_path, "branch", branch, f"{remote}/{branch}")
+    _run(repo_path, "symbolic-ref", "HEAD", f"refs/heads/{branch}")
+    _run(repo_path, "reset", "-q")  # индекс = новая ветка, рабочие файлы не меняются
+
+
+def create_branch(repo_path: Path, name: str, ref: str) -> None:
+    _run(repo_path, "branch", name, ref)
+
+
+def stash_all(repo_path: Path, message: str) -> bool:
+    """Сохранить незакоммиченные изменения (включая новые файлы) в git stash. True — если было
+    что сохранять."""
+    if not has_local_changes(repo_path):
+        return False
+    _run(repo_path, "stash", "push", "-u", "-m", message)
+    return True
+
+
+def commit_all(repo_path: Path, message: str) -> bool:
+    """git add -A + commit, если есть что коммитить. True — если коммит создан."""
+    if not has_local_changes(repo_path):
+        return False
+    _run(repo_path, "add", "-A")
+    _run(repo_path, "commit", "-m", message)
+    return True
+
+
+def commit_tree_on_top(repo_path: Path, base_ref: str, message: str) -> str:
+    """Новый коммит поверх base_ref, в котором файлы ровно как в текущем HEAD ("наша версия как
+    основная" без force-push: история base_ref сохраняется). Возвращает sha нового коммита."""
+    tree = _run(repo_path, "rev-parse", "HEAD^{tree}")
+    return _run(repo_path, "commit-tree", tree, "-p", base_ref, "-m", message)
+
+
+def move_current_branch_to(repo_path: Path, sha: str) -> None:
+    """Передвинуть текущую ветку на sha, не трогая файлы на диске (они уже совпадают с sha)."""
+    branch = current_branch(repo_path)
+    _run(repo_path, "update-ref", f"refs/heads/{branch}", sha)
+    _run(repo_path, "reset", "-q")
+
+
+def merge_ref(repo_path: Path, ref: str) -> bool:
+    """git merge --no-edit ref. True — слияние прошло без конфликтов; False — есть конфликты
+    (файлы в состоянии unmerged ждут mergetool). Прочие ошибки — GitError."""
+    try:
+        _run(repo_path, "merge", "--no-edit", ref)
+        return True
+    except GitError:
+        if unmerged_files(repo_path):
+            return False
+        raise
+
+
+def finish_merge(repo_path: Path) -> None:
+    _run(repo_path, "commit", "--no-edit")

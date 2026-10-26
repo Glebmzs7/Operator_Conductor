@@ -81,10 +81,14 @@ def remote_to_github_web_url(remote_url: str, branch: str) -> Optional[str]:
 
 @dataclass
 class PendingQuestion:
-    kind: str  # "yes_no" | "choice" | "repo_data_conflict"
+    kind: str  # "yes_no" | "choice" | "repo_data_conflict" | "branch_mismatch"
     message: str = ""
     branch: str = ""
     diff_lines: List[str] = field(default_factory=list)
+    # Для "choice" и "branch_mismatch" (11.10.2026): описание ситуации и подписи кнопок с тегами
+    # ("0.0,0.0,0.0,2+" — "+" значит, что поверх этого тега есть ещё изменения).
+    situation: str = ""
+    labels: dict = field(default_factory=dict)
     central: dict = field(default_factory=dict)   # для "repo_data_conflict" — данные из config.json
     folder: dict = field(default_factory=dict)     # для "repo_data_conflict" — данные из .autosync_data
     event: threading.Event = field(default_factory=threading.Event)
@@ -664,8 +668,28 @@ class AutoSyncGUI:
         watcher.pending_question = None
         return bool(pq.result)
 
-    def ask_choice(self, watcher, branch: str, diff_lines: List[str]) -> "SyncChoice":
-        pq = PendingQuestion(kind="choice", branch=branch, diff_lines=diff_lines)
+    def ask_choice(self, watcher, branch: str, diff_lines: List[str], situation: str = "",
+                   local_label: str = "", git_label: str = "") -> "SyncChoice":
+        """Расхождение версий одной ветки — три стандартных варианта (см. _show_pending_dialog)."""
+        pq = PendingQuestion(
+            kind="choice", branch=branch, diff_lines=diff_lines, situation=situation,
+            labels={"local": local_label, "git": git_label},
+        )
+        watcher.pending_question = pq
+        self.root.after(0, self._show_pending_dialog, watcher, pq)
+        pq.event.wait()
+        watcher.pending_question = None
+        return pq.result  # type: ignore[return-value]
+
+    def ask_branch_mismatch(self, watcher, disk_branch: str, tracked_branch: str, disk_label: str,
+                            tracked_label: str, commits: List[str]) -> str:
+        """Расхождение ветки слежения (11.10.2026): на диске одна ветка, AutoSync следит за другой.
+        Возвращает "disk" (оставить ветку с диска — сменить ветку слежения) или "tracked"
+        (перейти на указанную ветку — дальше сверка версий)."""
+        pq = PendingQuestion(
+            kind="branch_mismatch", branch=tracked_branch, diff_lines=commits,
+            labels={"disk_branch": disk_branch, "disk": disk_label, "tracked": tracked_label},
+        )
         watcher.pending_question = pq
         self.root.after(0, self._show_pending_dialog, watcher, pq)
         pq.event.wait()
@@ -761,11 +785,54 @@ class AutoSyncGUI:
                       command=lambda: answer_repo_data("central")).pack(side="left", padx=6)
             tk.Button(buttons, text="Взять из папки проекта", width=22,
                       command=lambda: answer_repo_data("folder")).pack(side="left", padx=6)
+        elif pq.kind == "branch_mismatch":
+            disk_branch = pq.labels.get("disk_branch", "?")
+            tk.Label(
+                win,
+                text=(f"Расхождение ветки слежения в {watcher.name!r}: на диске открыта ветка "
+                      f"{disk_branch!r}, а AutoSync следит за {pq.branch!r}. Какая ветка правильная?"),
+                wraplength=520, justify="left",
+            ).pack(padx=16, pady=(16, 6), anchor="w")
+            if pq.diff_lines:
+                tk.Label(
+                    win,
+                    text=(f"Коммиты на {disk_branch!r}, которых нет в {pq.branch!r} (при выборе "
+                          f"{pq.branch!r} они останутся в ветке {disk_branch!r}, а файлы с диска "
+                          f"пойдут в сверку версий):"),
+                    wraplength=520, justify="left",
+                ).pack(padx=16, pady=(0, 4), anchor="w")
+                commits_box = tk.Text(win, height=min(10, max(3, len(pq.diff_lines))), width=70)
+                commits_box.insert("1.0", "\n".join(pq.diff_lines))
+                commits_box.configure(state="disabled")
+                commits_box.pack(padx=16, pady=4)
+
+            buttons = tk.Frame(win)
+            buttons.pack(pady=(8, 16))
+
+            def answer_branch(value: str):
+                pq.result = value
+                pq.event.set()
+                win.destroy()
+
+            tk.Button(
+                buttons, text=f"Оставить {disk_branch} — {pq.labels.get('disk', '')}",
+                command=lambda: answer_branch("disk"),
+            ).pack(side="left", padx=6)
+            tk.Button(
+                buttons, text=f"Перейти на {pq.branch} — {pq.labels.get('tracked', '')}",
+                command=lambda: answer_branch("tracked"),
+            ).pack(side="left", padx=6)
         else:
-            tk.Label(win, text=f"Расхождение в ветке {pq.branch!r}:", justify="left").pack(
-                padx=16, pady=(16, 4), anchor="w"
+            # Расхождение версий одной ветки — три стандартных варианта (11.10.2026). На кнопках —
+            # к какому тегу ведёт выбор; "+" — поверх тега есть ещё изменения.
+            tk.Label(
+                win, text=pq.situation or f"Расхождение в ветке {pq.branch!r}:",
+                wraplength=520, justify="left",
+            ).pack(padx=16, pady=(16, 4), anchor="w")
+            tk.Label(win, text="Файлы, которые различаются (диск ↔ git):", justify="left").pack(
+                padx=16, pady=(4, 0), anchor="w"
             )
-            diff_box = tk.Text(win, height=min(10, max(3, len(pq.diff_lines))), width=60)
+            diff_box = tk.Text(win, height=min(10, max(3, len(pq.diff_lines))), width=70)
             diff_box.insert("1.0", "\n".join(pq.diff_lines) if pq.diff_lines else "(нет данных о разнице)")
             diff_box.configure(state="disabled")
             diff_box.pack(padx=16, pady=4)
@@ -778,11 +845,11 @@ class AutoSyncGUI:
                 pq.event.set()
                 win.destroy()
 
-            tk.Button(buttons, text="Оставить локальное", width=20,
-                      command=lambda: answer(SyncChoice.TAKE_LOCAL)).pack(side="left", padx=6)
-            tk.Button(buttons, text="Взять с git", width=16,
+            tk.Button(buttons, text=f"Взять всё с git — {pq.labels.get('git', '')}",
                       command=lambda: answer(SyncChoice.TAKE_GIT)).pack(side="left", padx=6)
-            tk.Button(buttons, text="Mergetool", width=14,
+            tk.Button(buttons, text=f"Отправить нашу версию как основную — {pq.labels.get('local', '')}",
+                      command=lambda: answer(SyncChoice.TAKE_LOCAL)).pack(side="left", padx=6)
+            tk.Button(buttons, text="Избирательно (слияние + mergetool)",
                       command=lambda: answer(SyncChoice.OPEN_MERGETOOL)).pack(side="left", padx=6)
 
         _finalize_toplevel(win)
